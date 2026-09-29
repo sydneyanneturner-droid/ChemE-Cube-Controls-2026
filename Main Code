@@ -1,0 +1,169 @@
+```cpp
+#include <SPI.h>
+#include <Adafruit_MAX31855.h>
+
+const int PRESSURE_PIN = A0;
+
+const int THERMO_CLK = 13;
+const int THERMO_CS = 10;
+const int THERMO_DO = 12;
+
+const int COMPRESSOR_PIN = 7;
+
+Adafruit_MAX31855 thermocouple(
+  THERMO_CLK,
+  THERMO_CS,
+  THERMO_DO
+);
+
+const float SHUNT_RESISTOR = 250.0;
+
+const float R_TOP = 10000.0;
+const float R_BOTTOM = 20000.0;
+
+const float PRESSURE_LIMIT = 5.0;
+const float TEMPERATURE_LIMIT = 50.0;
+
+const unsigned long COOLDOWN_TIME = 5000;
+const unsigned long READ_INTERVAL = 500;
+
+unsigned long lastReadTime = 0;
+unsigned long cooldownStart = 0;
+
+bool compressorOn = false;
+bool cooldownActive = false;
+
+float readPressure()
+{
+  int adcValue = analogRead(PRESSURE_PIN);
+
+  float adcVoltage = (adcValue / 1023.0) * 5.0;
+
+  float transmitterVoltage =
+    adcVoltage * ((R_TOP + R_BOTTOM) / R_BOTTOM);
+
+  float currentAmps =
+    transmitterVoltage / SHUNT_RESISTOR;
+
+  float currentmA =
+    currentAmps * 1000.0;
+
+  float pressure =
+    (currentmA - 4.0) * (15.0 / 16.0);
+
+  return pressure;
+}
+
+float readTemperature()
+{
+  return thermocouple.readCelsius();
+}
+
+void compressorStart()
+{
+  digitalWrite(COMPRESSOR_PIN, HIGH);
+  compressorOn = true;
+}
+
+void compressorStop()
+{
+  digitalWrite(COMPRESSOR_PIN, LOW);
+  compressorOn = false;
+}
+
+void startCooldown()
+{
+  compressorStop();
+
+  cooldownActive = true;
+  cooldownStart = millis();
+}
+
+void controlSystem(float pressure, float temperature)
+{
+  if (isnan(pressure) || isnan(temperature))
+  {
+    compressorStop();
+    cooldownActive = false;
+    return;
+  }
+
+  if (pressure > PRESSURE_LIMIT ||
+      temperature > TEMPERATURE_LIMIT)
+  {
+    if (!cooldownActive)
+    {
+      startCooldown();
+    }
+
+    return;
+  }
+
+  if (cooldownActive)
+  {
+    if (millis() - cooldownStart >= COOLDOWN_TIME)
+    {
+      cooldownActive = false;
+    }
+    else
+    {
+      compressorStop();
+      return;
+    }
+  }
+
+  if (!cooldownActive)
+  {
+    compressorStart();
+  }
+}
+
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(COMPRESSOR_PIN, OUTPUT);
+
+  digitalWrite(COMPRESSOR_PIN, LOW);
+
+  delay(500);
+}
+
+void loop()
+{
+  if (millis() - lastReadTime >= READ_INTERVAL)
+  {
+    lastReadTime = millis();
+
+    float pressure = readPressure();
+    float temperature = readTemperature();
+
+    controlSystem(
+      pressure,
+      temperature
+    );
+
+    Serial.print("Pressure: ");
+    Serial.print(pressure, 2);
+    Serial.print(" PSI | Temperature: ");
+    Serial.print(temperature, 2);
+    Serial.print(" C | Compressor: ");
+
+    if (compressorOn)
+    {
+      Serial.print("ON");
+    }
+    else
+    {
+      Serial.print("OFF");
+    }
+
+    if (cooldownActive)
+    {
+      Serial.print(" | COOLDOWN");
+    }
+
+    Serial.println();
+  }
+}
+```
