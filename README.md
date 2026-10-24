@@ -69,12 +69,10 @@ the actual sensor supports that range.
 1. The Arduino reads both pressure sensors and both temperature
    sensors.
 2. It checks readings for invalid values and implausible ranges.
-3. It compares the two pressure readings and the two temperature
-   readings.
-4. If any limit is exceeded or a fault is detected, the pump is
+3. If any limit is exceeded or a fault is detected, the pump is
    commanded OFF and the fault is latched.
-5. The pump remains OFF while the fault persists.
-6. After the readings are valid, agree sufficiently, and remain
+4. The pump remains OFF while the fault persists.
+5. After the readings are valid, agree sufficiently, and remain
    within limits for the recovery period, the controller permits
    the pump to restart.
 
@@ -88,7 +86,6 @@ The code checks for:
 - Temperatures outside the configured valid range.
 - Pressure transmitter current outside configured bounds.
 - Pressure readings outside the configured calibrated range.
-- Excessive disagreement between duplicate sensors.
 - Pressure or temperature limits being exceeded.
 
 These checks cannot detect every possible sensor failure.
