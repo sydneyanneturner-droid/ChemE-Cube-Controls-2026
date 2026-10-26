@@ -3,7 +3,7 @@
 ## Overview
 
 This project controls a 12 V vacuum pump using an Arduino Uno,
-two pressure transmitters, and two Type K thermocouples.
+two pressure transmitters, and two Type J thermocouples.
 
 The controller monitors pressure and temperature and switches
 the pump through an external N-channel MOSFET.
@@ -20,7 +20,7 @@ before automatically restarting the pump.
 
 - Arduino Uno
 - 2 pressure transmitters with 4–20 mA outputs
-- 2 Type K thermocouples
+- 2 Type J thermocouples
 - 2 MAX31855 thermocouple interface modules
 - 2 separate 250-ohm shunt resistors
 - 2 voltage-divider circuits per the wiring design
