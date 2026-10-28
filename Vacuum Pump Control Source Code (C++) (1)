@@ -1,0 +1,422 @@
+#include <SPI.h>
+#include <Adafruit_MAX31855.h>
+#include <math.h>
+
+// =====================================================
+// PIN ASSIGNMENTS
+// =====================================================
+
+// Pressure transmitters: each has its own measurement circuit
+const int PRESSURE_PIN_1 = A0;
+const int PRESSURE_PIN_2 = A1;
+
+// MAX31855 modules share clock and data-out
+const int THERMO_CLK = 13;
+const int THERMO_DO  = 12;
+const int THERMO_CS_1 = 10;
+const int THERMO_CS_2 = 9;
+
+// MOSFET gate controlling the vacuum pump (via 220 ohm R_GATE)
+const int PUMP_PIN = 7;
+
+Adafruit_MAX31855 thermocouple1(
+  THERMO_CLK, THERMO_CS_1, THERMO_DO
+);
+
+Adafruit_MAX31855 thermocouple2(
+  THERMO_CLK, THERMO_CS_2, THERMO_DO
+);
+
+// The MAX31855 is built for ONE thermocouple type. The common
+// Adafruit board (product 269) uses the K-type chip, but the probes
+// here are Type J, so the K-chip reading is converted to Type J
+// in software (see correctKChipForJ below).
+//   true  = amp is a MAX31855K (chip marking ends in K) -> convert
+//   false = amp is a MAX31855J -> use the chip reading as-is
+const bool AMP_IS_K_TYPE = true;
+
+// Thermocouple sensitivity the K-type chip assumes (microvolts/degC)
+const float K_CHIP_UV_PER_C = 41.276;
+
+// NIST ITS-90 Type J: temperature (degC) -> voltage (mV), -210..760 C
+const float J_VOLT_COEFF[9] = {
+  0.0,
+  5.0381187815e-2,
+  3.0475836930e-5,
+ -8.5681065720e-8,
+  1.3228195295e-10,
+ -1.7052958337e-13,
+  2.0948090697e-16,
+ -1.2538395336e-19,
+  1.5631254546e-23
+};
+
+// NIST ITS-90 Type J: voltage (mV) -> temperature (degC)
+// 0 to 42.919 mV (0 to 760 C)
+const float J_TEMP_COEFF_POS[8] = {
+  0.0,
+  1.978425e1,
+ -2.001204e-1,
+  1.036969e-2,
+ -2.549687e-4,
+  3.585153e-6,
+ -5.344285e-8,
+  5.099890e-10
+};
+
+// -8.095 to 0 mV (-210 to 0 C)
+const float J_TEMP_COEFF_NEG[9] = {
+  0.0,
+  1.9528268e1,
+ -1.2286185,
+ -1.0752178,
+ -5.9086933e-1,
+ -1.7256713e-1,
+ -2.8131513e-2,
+ -2.3963370e-3,
+ -8.3823321e-5
+};
+
+// Arduino Uno R4 Minima ADC (default 10-bit, 5 V reference)
+const float ADC_REFERENCE_V = 5.00;
+
+// Each transmitter uses a 100-ohm shunt resistor
+// and a 10k/20k voltage divider.
+// The transmitters are powered directly from the 12 V rail (no boost
+// converter), so the shunt is kept small to leave the transmitter enough
+// loop voltage: 12 V - (20 mA x ~100 ohm) is about 10 V at full scale.
+const float SHUNT_RESISTOR_OHMS = 100.0;
+const float R_TOP_OHMS = 10000.0;
+const float R_BOTTOM_OHMS = 20000.0;
+
+// The divider loads the shunt slightly, so use the parallel value
+// (about 99.7 ohm) when converting shunt voltage to current.
+const float SHUNT_EFFECTIVE_OHMS =
+    (SHUNT_RESISTOR_OHMS * (R_TOP_OHMS + R_BOTTOM_OHMS)) /
+    (SHUNT_RESISTOR_OHMS + R_TOP_OHMS + R_BOTTOM_OHMS);
+
+const float PRESSURE_MIN_PSI = 0.0;
+const float PRESSURE_MAX_PSI = 15.0;
+
+// Operating limits
+const float PRESSURE_LIMIT_PSI = 5.0;
+const float TEMPERATURE_LIMIT_C = 50.0;
+
+// Plausibility limits for the sensors.
+// Adjust temperature range to the actual probe/system.
+const float MIN_VALID_TEMP_C = -50.0;
+const float MAX_VALID_TEMP_C = 150.0;
+
+const float MIN_VALID_CURRENT_MA = 3.6;
+const float MAX_VALID_CURRENT_MA = 21.0;
+
+// Sensor disagreement limits
+const float PRESSURE_DISAGREEMENT_PSI = 2.0;
+const float TEMP_DISAGREEMENT_C = 10.0;
+
+// Timing
+const unsigned long READ_INTERVAL_MS = 500;
+const unsigned long RECOVERY_TIME_MS = 5000;
+
+// Require several consecutive good readings before recovery
+const int REQUIRED_GOOD_READINGS = 10;
+
+// =====================================================
+// STATE
+// =====================================================
+
+unsigned long lastReadTime = 0;
+unsigned long safeSince = 0;
+
+bool pumpOn = false;
+bool faultLatched = true;  // Start with pump OFF
+int consecutiveGoodReadings = 0;
+
+String faultReason = "Startup: waiting for valid readings";
+
+// =====================================================
+// PRESSURE READING
+// =====================================================
+
+float readPressure(int pin, bool &valid)
+{
+  int adcValue = analogRead(pin);
+
+  float adcVoltage =
+      (adcValue / 1023.0) * ADC_REFERENCE_V;
+
+  // Undo the external voltage divider
+  float transmitterVoltage =
+      adcVoltage *
+      ((R_TOP_OHMS + R_BOTTOM_OHMS) / R_BOTTOM_OHMS);
+
+  // Convert voltage across the shunt to current
+  float current_mA =
+      (transmitterVoltage / SHUNT_EFFECTIVE_OHMS) * 1000.0;
+
+  // Detect open-circuit, short-circuit, or out-of-range current
+  if (!isfinite(current_mA) ||
+      current_mA < MIN_VALID_CURRENT_MA ||
+      current_mA > MAX_VALID_CURRENT_MA)
+  {
+    valid = false;
+    return NAN;
+  }
+
+  // Convert 4-20 mA linearly to the configured pressure range
+  float pressure =
+      PRESSURE_MIN_PSI +
+      ((current_mA - 4.0) / 16.0) *
+      (PRESSURE_MAX_PSI - PRESSURE_MIN_PSI);
+
+  if (!isfinite(pressure) ||
+      pressure < PRESSURE_MIN_PSI - 0.5 ||
+      pressure > PRESSURE_MAX_PSI + 0.5)
+  {
+    valid = false;
+    return NAN;
+  }
+
+  valid = true;
+  return pressure;
+}
+
+// =====================================================
+// TYPE J CONVERSION (for a K-type MAX31855)
+// =====================================================
+
+// Type J voltage (mV) at a given temperature (degC)
+float jVoltageMv(float tempC)
+{
+  float result = 0.0;
+  for (int i = 8; i >= 0; i--)
+  {
+    result = result * tempC + J_VOLT_COEFF[i];
+  }
+  return result;
+}
+
+// Type J temperature (degC) for a given voltage (mV)
+float jTempFromMv(float mV)
+{
+  float result = 0.0;
+
+  if (mV >= 0.0)
+  {
+    for (int i = 7; i >= 0; i--)
+    {
+      result = result * mV + J_TEMP_COEFF_POS[i];
+    }
+  }
+  else
+  {
+    for (int i = 8; i >= 0; i--)
+    {
+      result = result * mV + J_TEMP_COEFF_NEG[i];
+    }
+  }
+
+  return result;
+}
+
+// The MAX31855K reports: chipTemp = V / 41.276 uV/degC + coldJunction.
+// Undo that to get the real thermocouple voltage, add the Type J
+// voltage of the cold junction, then convert back with Type J tables.
+float correctKChipForJ(float chipTempC, float coldJunctionC)
+{
+  float thermocoupleMv =
+      (chipTempC - coldJunctionC) * (K_CHIP_UV_PER_C / 1000.0);
+
+  float totalMv = thermocoupleMv + jVoltageMv(coldJunctionC);
+
+  return jTempFromMv(totalMv);
+}
+
+// =====================================================
+// TEMPERATURE READING
+// =====================================================
+
+float readTemperature(
+  Adafruit_MAX31855 &sensor,
+  bool &valid)
+{
+  // NAN here means a fault (open or shorted thermocouple)
+  float temperature = sensor.readCelsius();
+
+  if (isfinite(temperature) && AMP_IS_K_TYPE)
+  {
+    float coldJunction = sensor.readInternal();
+
+    if (isfinite(coldJunction))
+    {
+      temperature = correctKChipForJ(temperature, coldJunction);
+    }
+    else
+    {
+      temperature = NAN;
+    }
+  }
+
+  if (!isfinite(temperature) ||
+      temperature < MIN_VALID_TEMP_C ||
+      temperature > MAX_VALID_TEMP_C)
+  {
+    valid = false;
+    return NAN;
+  }
+
+  valid = true;
+  return temperature;
+}
+
+// =====================================================
+// PUMP CONTROL
+// =====================================================
+
+void pumpOff()
+{
+  digitalWrite(PUMP_PIN, LOW);
+  pumpOn = false;
+}
+
+void pumpOnNow()
+{
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpOn = true;
+}
+
+// =====================================================
+// MAIN SAFETY LOGIC
+// =====================================================
+
+void updateControl(
+  float p1, float p2,
+  float t1, float t2,
+  bool p1Valid, bool p2Valid,
+  bool t1Valid, bool t2Valid)
+{
+  // Any invalid sensor reading means pump OFF
+  if (!p1Valid || !p2Valid || !t1Valid || !t2Valid)
+  {
+    faultLatched = true;
+    consecutiveGoodReadings = 0;
+    safeSince = 0;
+    faultReason = "Invalid or out-of-range sensor reading";
+    pumpOff();
+    return;
+  }
+
+  // Any sensor exceeding its limit trips the system.
+  // Negative pressure is allowed IF the transmitter
+  // is rated and configured for a negative pressure range.
+  if (p1 > PRESSURE_LIMIT_PSI ||
+      p2 > PRESSURE_LIMIT_PSI ||
+      t1 > TEMPERATURE_LIMIT_C ||
+      t2 > TEMPERATURE_LIMIT_C)
+  {
+    faultLatched = true;
+    consecutiveGoodReadings = 0;
+    safeSince = 0;
+    faultReason = "Pressure or temperature limit exceeded";
+    pumpOff();
+    return;
+  }
+
+  // Once tripped, require sustained safe readings
+  if (faultLatched)
+  {
+    if (consecutiveGoodReadings == 0)
+    {
+      safeSince = millis();
+    }
+
+    consecutiveGoodReadings++;
+
+    if (consecutiveGoodReadings >= REQUIRED_GOOD_READINGS &&
+        millis() - safeSince >= RECOVERY_TIME_MS)
+    {
+      faultLatched = false;
+      faultReason = "Recovered: readings valid and within limits";
+      consecutiveGoodReadings = 0;
+      pumpOnNow();
+    }
+    else
+    {
+      pumpOff();
+    }
+
+    return;
+  }
+
+  // Normal operation
+  pumpOnNow();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  pumpOff();
+
+  Serial.println("Vacuum pump controller starting.");
+  Serial.println("Pump held OFF until sensors are validated.");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  if (millis() - lastReadTime < READ_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastReadTime = millis();
+
+  bool p1Valid = false;
+  bool p2Valid = false;
+  bool t1Valid = false;
+  bool t2Valid = false;
+
+  float p1 = readPressure(PRESSURE_PIN_1, p1Valid);
+  float p2 = readPressure(PRESSURE_PIN_2, p2Valid);
+
+  float t1 = readTemperature(thermocouple1, t1Valid);
+  float t2 = readTemperature(thermocouple2, t2Valid);
+
+  updateControl(
+    p1, p2, t1, t2,
+    p1Valid, p2Valid, t1Valid, t2Valid
+  );
+
+  // Diagnostic output
+  Serial.println("----------------------------");
+
+  Serial.print("Pressure 1: ");
+  Serial.println(p1Valid ? String(p1, 2) : "INVALID");
+
+  Serial.print("Pressure 2: ");
+  Serial.println(p2Valid ? String(p2, 2) : "INVALID");
+
+  Serial.print("Temperature 1: ");
+  Serial.println(t1Valid ? String(t1, 2) : "INVALID");
+
+  Serial.print("Temperature 2: ");
+  Serial.println(t2Valid ? String(t2, 2) : "INVALID");
+
+  Serial.print("Pump: ");
+  Serial.println(pumpOn ? "ON" : "OFF");
+
+  Serial.print("Fault state: ");
+  Serial.println(faultLatched ? "LATCHED" : "CLEAR");
+
+  Serial.print("Reason: ");
+  Serial.println(faultReason);
+}
