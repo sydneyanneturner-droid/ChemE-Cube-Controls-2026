@@ -3,6 +3,14 @@
 #include <math.h>
 
 // =====================================================
+// BENCH TEST SWITCH
+// =====================================================
+// 1 = bench test: pressure limits lowered so they can be reached
+//     by blowing into a sensor port at ambient conditions.
+// 0 = normal operation. SET BACK TO 0 BEFORE REAL USE.
+#define BENCH_TEST 0
+
+// =====================================================
 // PIN ASSIGNMENTS
 // =====================================================
 
@@ -64,16 +72,21 @@ const int RAMP_UP_STEP_PCT = 2;
 // =====================================================
 
 // Throttle thresholds: above these, the pump slows down.
-const float THROTTLE_PRESSURE_PSI = 4.0;
-const float THROTTLE_TEMP_C = 45.0;
-
 // Hysteresis: the pump only speeds back up once readings drop
 // this far below the throttle threshold. Prevents hunting.
-const float PRESSURE_HYSTERESIS_PSI = 0.5;
-const float TEMP_HYSTERESIS_C = 2.0;
-
 // Hard trip limits: above these, the pump shuts OFF and latches.
+#if BENCH_TEST
+const float THROTTLE_PRESSURE_PSI = 0.5;
+const float PRESSURE_HYSTERESIS_PSI = 0.2;
+const float PRESSURE_TRIP_PSI = 1.5;
+#else
+const float THROTTLE_PRESSURE_PSI = 4.0;
+const float PRESSURE_HYSTERESIS_PSI = 0.5;
 const float PRESSURE_TRIP_PSI = 5.0;
+#endif
+
+const float THROTTLE_TEMP_C = 45.0;
+const float TEMP_HYSTERESIS_C = 2.0;
 const float TEMPERATURE_TRIP_C = 50.0;
 
 // Plausibility limits for the sensors.
@@ -395,6 +408,9 @@ void loop()
 
   // Diagnostic output
   Serial.println(F("----------------------------"));
+#if BENCH_TEST
+  Serial.println(F("*** BENCH TEST MODE: pressure limits 0.5/1.5 psig ***"));
+#endif
 
   Serial.print(F("Pressure 1 (psig): "));
   if (p1Valid) Serial.println(p1, 2); else Serial.println(F("INVALID"));
