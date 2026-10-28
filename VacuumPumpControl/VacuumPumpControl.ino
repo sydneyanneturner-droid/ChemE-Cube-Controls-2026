@@ -122,7 +122,7 @@ const char *controlMode = "OFF";
 // PRESSURE READING
 // =====================================================
 
-float readPressure(int pin, bool &valid)
+float readPressure(int pin, bool &valid, float &current_mA)
 {
   int adcValue = analogRead(pin);
 
@@ -135,7 +135,7 @@ float readPressure(int pin, bool &valid)
       ((R_TOP_OHMS + R_BOTTOM_OHMS) / R_BOTTOM_OHMS);
 
   // Convert voltage across the shunt to current
-  float current_mA =
+  current_mA =
       (transmitterVoltage / SHUNT_RESISTOR_OHMS) * 1000.0;
 
   // Detect open-circuit, short-circuit, or out-of-range current
@@ -213,11 +213,22 @@ float typeJ_C(float mV)
 
 float readTemperature(
   Adafruit_MAX31855 &sensor,
-  bool &valid)
+  bool &valid,
+  float &reportedK,
+  float &coldJunction)
 {
   // readCelsius() returns NAN on open/short faults
-  float reportedK = sensor.readCelsius();
-  float coldJunction = sensor.readInternal();
+  reportedK = sensor.readCelsius();
+  coldJunction = sensor.readInternal();
+
+  // An unpowered board or a broken CLK/DO/CS wire reads as all zeros,
+  // which looks like a valid 0.00 C with no fault bits set. A real board
+  // essentially never reports exactly 0 for both values, so reject it.
+  if (reportedK == 0.0 && coldJunction == 0.0)
+  {
+    valid = false;
+    return NAN;
+  }
 
   // Back out the measured thermocouple voltage (mV)
   float tcVoltage_mV =
@@ -395,11 +406,14 @@ void loop()
   bool t1Valid = false;
   bool t2Valid = false;
 
-  float p1 = readPressure(PRESSURE_PIN_1, p1Valid);
-  float p2 = readPressure(PRESSURE_PIN_2, p2Valid);
+  // Raw values, printed for wiring diagnosis
+  float mA1, mA2, rawK1, rawK2, cj1, cj2;
 
-  float t1 = readTemperature(thermocouple1, t1Valid);
-  float t2 = readTemperature(thermocouple2, t2Valid);
+  float p1 = readPressure(PRESSURE_PIN_1, p1Valid, mA1);
+  float p2 = readPressure(PRESSURE_PIN_2, p2Valid, mA2);
+
+  float t1 = readTemperature(thermocouple1, t1Valid, rawK1, cj1);
+  float t2 = readTemperature(thermocouple2, t2Valid, rawK2, cj2);
 
   updateControl(
     p1, p2, t1, t2,
@@ -413,16 +427,32 @@ void loop()
 #endif
 
   Serial.print(F("Pressure 1 (psig): "));
-  if (p1Valid) Serial.println(p1, 2); else Serial.println(F("INVALID"));
+  if (p1Valid) Serial.print(p1, 2); else Serial.print(F("INVALID"));
+  Serial.print(F("   [loop "));
+  Serial.print(mA1, 2);
+  Serial.println(F(" mA]"));
 
   Serial.print(F("Pressure 2 (psig): "));
-  if (p2Valid) Serial.println(p2, 2); else Serial.println(F("INVALID"));
+  if (p2Valid) Serial.print(p2, 2); else Serial.print(F("INVALID"));
+  Serial.print(F("   [loop "));
+  Serial.print(mA2, 2);
+  Serial.println(F(" mA]"));
 
   Serial.print(F("Temperature 1 (C): "));
-  if (t1Valid) Serial.println(t1, 2); else Serial.println(F("INVALID"));
+  if (t1Valid) Serial.print(t1, 2); else Serial.print(F("INVALID"));
+  Serial.print(F("   [chip raw "));
+  Serial.print(rawK1, 2);
+  Serial.print(F(", board "));
+  Serial.print(cj1, 2);
+  Serial.println(F("]"));
 
   Serial.print(F("Temperature 2 (C): "));
-  if (t2Valid) Serial.println(t2, 2); else Serial.println(F("INVALID"));
+  if (t2Valid) Serial.print(t2, 2); else Serial.print(F("INVALID"));
+  Serial.print(F("   [chip raw "));
+  Serial.print(rawK2, 2);
+  Serial.print(F(", board "));
+  Serial.print(cj2, 2);
+  Serial.println(F("]"));
 
   Serial.print(F("Pump duty: "));
   Serial.print(dutyPct);
