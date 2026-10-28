@@ -17,7 +17,7 @@ const int THERMO_CS_1 = 10;
 const int THERMO_CS_2 = 9;
 
 // MOSFET gate controlling the vacuum pump (via 220 ohm R_GATE)
-const int PUMP_PIN = 7;
+const int PUMP_PIN = 6;
 
 Adafruit_MAX31855 thermocouple1(
   THERMO_CLK, THERMO_CS_1, THERMO_DO
