@@ -10,13 +10,15 @@
 const int PRESSURE_PIN_1 = A0;
 const int PRESSURE_PIN_2 = A1;
 
-// MAX31855 modules share clock and data-out
+// MAX31855 modules share clock and data-out.
+// NOTE: the modules must be the J-type chip variant to match the
+// Type J thermocouples (Adafruit 269 is K-type only).
 const int THERMO_CLK = 13;
 const int THERMO_DO  = 12;
 const int THERMO_CS_1 = 10;
 const int THERMO_CS_2 = 9;
 
-// MOSFET gate controlling the vacuum pump
+// MOSFET gate controlling the vacuum pump (via 220 ohm R_GATE)
 const int PUMP_PIN = 7;
 
 Adafruit_MAX31855 thermocouple1(
@@ -27,14 +29,23 @@ Adafruit_MAX31855 thermocouple2(
   THERMO_CLK, THERMO_CS_2, THERMO_DO
 );
 
-// Arduino Uno ADC
+// Arduino Uno R4 Minima ADC (default 10-bit, 5 V reference)
 const float ADC_REFERENCE_V = 5.00;
 
-// Each transmitter uses a 250-ohm shunt resistor
+// Each transmitter uses a 100-ohm shunt resistor
 // and a 10k/20k voltage divider.
-const float SHUNT_RESISTOR_OHMS = 250.0;
+// The transmitters are powered directly from the 12 V rail (no boost
+// converter), so the shunt is kept small to leave the transmitter enough
+// loop voltage: 12 V - (20 mA x ~100 ohm) is about 10 V at full scale.
+const float SHUNT_RESISTOR_OHMS = 100.0;
 const float R_TOP_OHMS = 10000.0;
 const float R_BOTTOM_OHMS = 20000.0;
+
+// The divider loads the shunt slightly, so use the parallel value
+// (about 99.7 ohm) when converting shunt voltage to current.
+const float SHUNT_EFFECTIVE_OHMS =
+    (SHUNT_RESISTOR_OHMS * (R_TOP_OHMS + R_BOTTOM_OHMS)) /
+    (SHUNT_RESISTOR_OHMS + R_TOP_OHMS + R_BOTTOM_OHMS);
 
 const float PRESSURE_MIN_PSI = 0.0;
 const float PRESSURE_MAX_PSI = 15.0;
@@ -93,7 +104,7 @@ float readPressure(int pin, bool &valid)
 
   // Convert voltage across the shunt to current
   float current_mA =
-      (transmitterVoltage / SHUNT_RESISTOR_OHMS) * 1000.0;
+      (transmitterVoltage / SHUNT_EFFECTIVE_OHMS) * 1000.0;
 
   // Detect open-circuit, short-circuit, or out-of-range current
   if (!isfinite(current_mA) ||
