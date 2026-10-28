@@ -3,7 +3,7 @@
 ## Overview
 
 This project controls a 12 V vacuum pump using an Arduino Uno,
-two pressure transmitters, and two Type K thermocouples.
+two pressure transmitters, and two Type J thermocouples.
 
 The controller drives the pump with PWM through an external
 N-channel MOSFET. It runs the pump at the duty cycle calibrated
@@ -31,9 +31,29 @@ Adafruit BusIO) from the Library Manager. Board: Arduino Uno.
 
 - Arduino Uno
 - 2 pressure transmitters with 4–20 mA outputs
-- 2 Type K thermocouples
-- 2 MAX31855K thermocouple interface modules (the standard
-  MAX31855 is Type K only; Type J probes need MAX31855J boards)
+- 2 Type J thermocouples
+- 2 MAX31855 (K version) thermocouple interface modules
+
+## Type J Probes on MAX31855K Boards
+
+The standard MAX31855 assumes a Type K thermocouple. It does no
+linearization; it reports cold-junction temperature plus the
+thermocouple voltage divided by 41.276 uV/C. The sketch reads both
+the reported value and the board's cold-junction temperature,
+recovers the raw thermocouple voltage, and converts it with the
+NIST ITS-90 Type J polynomials (`readTemperature()`).
+
+Without this correction a Type J probe reads high: about 7 C high
+at 50 C and about 40 C high at 150 C.
+
+Limits of the workaround:
+- Chip resolution is 0.25 C in K terms (about 0.2 C in J terms).
+- The chip's own accuracy spec (about +/-2 C) still applies.
+- Keep the board's thermocouple terminals at the same temperature
+  as the chip (out of drafts and away from heat sources), because
+  the cold-junction reading is the chip's internal temperature.
+- Check both channels against a reference thermometer (ice
+  bath and warm water) before relying on the readings.
 - 2 separate 250-ohm shunt resistors
 - 2 voltage-divider circuits per the wiring design
 - Logic-level N-channel MOSFET suitable for the pump current

@@ -156,11 +156,62 @@ float readPressure(int pin, bool &valid)
 // TEMPERATURE READING
 // =====================================================
 
+// The probes are Type J, but the MAX31855 (K version) assumes Type K.
+// The chip does no linearization: it reports
+//   T_reported = T_coldJunction + V_thermocouple / 41.276 uV/C
+// so we can recover the raw thermocouple voltage and convert it with
+// the NIST ITS-90 Type J polynomials instead.
+const float MAX31855K_UV_PER_C = 41.276;
+
+// NIST ITS-90 Type J: temperature (C) -> EMF (mV), valid -210..760 C
+float typeJ_mV(float t)
+{
+  const float c[] = {
+    0.0, 5.0381187815E-02, 3.0475836930E-05, -8.5681065720E-08,
+    1.3228195295E-10, -1.7052958337E-13, 2.0948090697E-16,
+    -1.2538395336E-19, 1.5631725697E-23
+  };
+  float e = 0.0;
+  for (int i = 8; i >= 0; i--) e = e * t + c[i];
+  return e;
+}
+
+// NIST ITS-90 Type J inverse: EMF (mV) -> temperature (C)
+float typeJ_C(float mV)
+{
+  // -210..0 C (-8.095..0 mV)
+  const float neg[] = {
+    0.0, 1.9528268E+01, -1.2286185E+00, -1.0752178E+00,
+    -5.9086933E-01, -1.7256713E-01, -2.8131513E-02,
+    -2.3963370E-03, -8.3823321E-05
+  };
+  // 0..760 C (0..42.919 mV)
+  const float pos[] = {
+    0.0, 1.978425E+01, -2.001204E-01, 1.036969E-02,
+    -2.549687E-04, 3.585153E-06, -5.344285E-08, 5.099890E-10
+  };
+  float t = 0.0;
+  if (mV < 0.0)
+    for (int i = 8; i >= 0; i--) t = t * mV + neg[i];
+  else
+    for (int i = 7; i >= 0; i--) t = t * mV + pos[i];
+  return t;
+}
+
 float readTemperature(
   Adafruit_MAX31855 &sensor,
   bool &valid)
 {
-  float temperature = sensor.readCelsius();
+  // readCelsius() returns NAN on open/short faults
+  float reportedK = sensor.readCelsius();
+  float coldJunction = sensor.readInternal();
+
+  // Back out the measured thermocouple voltage (mV)
+  float tcVoltage_mV =
+      (reportedK - coldJunction) * MAX31855K_UV_PER_C / 1000.0;
+
+  // Add cold-junction compensation using the Type J curve
+  float temperature = typeJ_C(tcVoltage_mV + typeJ_mV(coldJunction));
 
   if (!isfinite(temperature) ||
       temperature < MIN_VALID_TEMP_C ||
