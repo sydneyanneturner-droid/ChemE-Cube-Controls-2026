@@ -16,8 +16,9 @@ const int THERMO_DO  = 12;
 const int THERMO_CS_1 = 10;
 const int THERMO_CS_2 = 9;
 
-// MOSFET gate controlling the vacuum pump
-const int PUMP_PIN = 7;
+// MOSFET gate controlling the vacuum pump.
+// Must be a PWM pin. D6 runs at ~980 Hz on the Uno (Timer0).
+const int PUMP_PIN = 6;
 
 Adafruit_MAX31855 thermocouple1(
   THERMO_CLK, THERMO_CS_1, THERMO_DO
@@ -39,9 +40,41 @@ const float R_BOTTOM_OHMS = 20000.0;
 const float PRESSURE_MIN_PSI = 0.0;
 const float PRESSURE_MAX_PSI = 15.0;
 
-// Operating limits
-const float PRESSURE_LIMIT_PSI = 5.0;
-const float TEMPERATURE_LIMIT_C = 50.0;
+// =====================================================
+// FLOW / SPEED SETTINGS
+// =====================================================
+// There is no flow sensor, so flow is set open-loop by PWM duty.
+// TARGET_DUTY_PCT MUST be calibrated: run the pump at several duty
+// values with a flowmeter/rotameter on the line and pick the duty
+// that gives 10 L/min at normal operating conditions.
+const float TARGET_FLOW_LPM = 10.0;   // for display only
+const int TARGET_DUTY_PCT = 80;       // <-- CALIBRATE: duty for 10 L/min
+
+// Lowest duty the pump still turns reliably at. Below this a brushed
+// motor can stall and overheat. CALIBRATE on the real pump.
+const int MIN_DUTY_PCT = 35;
+
+// How fast the speed changes, per reading (every READ_INTERVAL_MS).
+// Slow down quickly, speed back up gently.
+const int RAMP_DOWN_STEP_PCT = 5;
+const int RAMP_UP_STEP_PCT = 2;
+
+// =====================================================
+// OPERATING LIMITS
+// =====================================================
+
+// Throttle thresholds: above these, the pump slows down.
+const float THROTTLE_PRESSURE_PSI = 4.0;
+const float THROTTLE_TEMP_C = 45.0;
+
+// Hysteresis: the pump only speeds back up once readings drop
+// this far below the throttle threshold. Prevents hunting.
+const float PRESSURE_HYSTERESIS_PSI = 0.5;
+const float TEMP_HYSTERESIS_C = 2.0;
+
+// Hard trip limits: above these, the pump shuts OFF and latches.
+const float PRESSURE_TRIP_PSI = 5.0;
+const float TEMPERATURE_TRIP_C = 50.0;
 
 // Plausibility limits for the sensors.
 // Adjust temperature range to the actual probe/system.
@@ -50,10 +83,6 @@ const float MAX_VALID_TEMP_C = 150.0;
 
 const float MIN_VALID_CURRENT_MA = 3.6;
 const float MAX_VALID_CURRENT_MA = 21.0;
-
-// Sensor disagreement limits
-const float PRESSURE_DISAGREEMENT_PSI = 2.0;
-const float TEMP_DISAGREEMENT_C = 10.0;
 
 // Timing
 const unsigned long READ_INTERVAL_MS = 500;
@@ -69,11 +98,12 @@ const int REQUIRED_GOOD_READINGS = 10;
 unsigned long lastReadTime = 0;
 unsigned long safeSince = 0;
 
-bool pumpOn = false;
-bool faultLatched = true;  // Start with pump OFF
+int dutyPct = 0;            // current pump duty, 0 = OFF
+bool faultLatched = true;   // Start with pump OFF
 int consecutiveGoodReadings = 0;
 
-String faultReason = "Startup: waiting for valid readings";
+const char *faultReason = "Startup: waiting for valid readings";
+const char *controlMode = "OFF";
 
 // =====================================================
 // PRESSURE READING
@@ -148,20 +178,36 @@ float readTemperature(
 // PUMP CONTROL
 // =====================================================
 
-void pumpOff()
+void setPumpDuty(int pct)
 {
-  digitalWrite(PUMP_PIN, LOW);
-  pumpOn = false;
+  if (pct <= 0)
+  {
+    dutyPct = 0;
+    analogWrite(PUMP_PIN, 0);   // analogWrite(0) drives the pin fully LOW
+    return;
+  }
+
+  dutyPct = constrain(pct, MIN_DUTY_PCT, 100);
+  analogWrite(PUMP_PIN, map(dutyPct, 0, 100, 0, 255));
 }
 
-void pumpOnNow()
+void pumpOff()
 {
-  digitalWrite(PUMP_PIN, HIGH);
-  pumpOn = true;
+  setPumpDuty(0);
+}
+
+void tripPump(const char *reason)
+{
+  faultLatched = true;
+  consecutiveGoodReadings = 0;
+  safeSince = 0;
+  faultReason = reason;
+  controlMode = "OFF (TRIPPED)";
+  pumpOff();
 }
 
 // =====================================================
-// MAIN SAFETY LOGIC
+// MAIN CONTROL LOGIC
 // =====================================================
 
 void updateControl(
@@ -173,31 +219,22 @@ void updateControl(
   // Any invalid sensor reading means pump OFF
   if (!p1Valid || !p2Valid || !t1Valid || !t2Valid)
   {
-    faultLatched = true;
-    consecutiveGoodReadings = 0;
-    safeSince = 0;
-    faultReason = "Invalid or out-of-range sensor reading";
-    pumpOff();
+    tripPump("Invalid or out-of-range sensor reading");
     return;
   }
 
-  // Any sensor exceeding its limit trips the system.
-  // Negative pressure is allowed IF the transmitter
-  // is rated and configured for a negative pressure range.
-  if (p1 > PRESSURE_LIMIT_PSI ||
-      p2 > PRESSURE_LIMIT_PSI ||
-      t1 > TEMPERATURE_LIMIT_C ||
-      t2 > TEMPERATURE_LIMIT_C)
+  // The worst (highest) reading of each pair drives control.
+  float pMax = max(p1, p2);
+  float tMax = max(t1, t2);
+
+  // Hard limit: shut the pump OFF and latch.
+  if (pMax > PRESSURE_TRIP_PSI || tMax > TEMPERATURE_TRIP_C)
   {
-    faultLatched = true;
-    consecutiveGoodReadings = 0;
-    safeSince = 0;
-    faultReason = "Pressure or temperature limit exceeded";
-    pumpOff();
+    tripPump("Pressure or temperature trip limit exceeded");
     return;
   }
 
-  // Once tripped, require sustained safe readings
+  // Once tripped, require sustained safe readings before restart.
   if (faultLatched)
   {
     if (consecutiveGoodReadings == 0)
@@ -213,18 +250,48 @@ void updateControl(
       faultLatched = false;
       faultReason = "Recovered: readings valid and within limits";
       consecutiveGoodReadings = 0;
-      pumpOnNow();
+      controlMode = "SOFT START";
+      setPumpDuty(MIN_DUTY_PCT);   // soft start, ramp up from here
     }
     else
     {
+      controlMode = "OFF (RECOVERING)";
       pumpOff();
     }
 
     return;
   }
 
-  // Normal operation
-  pumpOnNow();
+  // Normal operation: throttle on high readings, otherwise
+  // ramp back toward the 10 L/min target duty.
+  bool overThrottle =
+      pMax > THROTTLE_PRESSURE_PSI ||
+      tMax > THROTTLE_TEMP_C;
+
+  bool clearOfThrottle =
+      pMax < THROTTLE_PRESSURE_PSI - PRESSURE_HYSTERESIS_PSI &&
+      tMax < THROTTLE_TEMP_C - TEMP_HYSTERESIS_C;
+
+  if (overThrottle)
+  {
+    controlMode = (dutyPct <= MIN_DUTY_PCT)
+                    ? "THROTTLED (AT MIN)"
+                    : "THROTTLING DOWN";
+    setPumpDuty(dutyPct - RAMP_DOWN_STEP_PCT);
+  }
+  else if (clearOfThrottle)
+  {
+    controlMode = (dutyPct >= TARGET_DUTY_PCT)
+                    ? "NORMAL (TARGET FLOW)"
+                    : "RAMPING UP";
+    setPumpDuty(min(dutyPct + RAMP_UP_STEP_PCT, TARGET_DUTY_PCT));
+  }
+  else
+  {
+    // Inside the hysteresis band: hold current speed.
+    controlMode = "HOLDING";
+    setPumpDuty(dutyPct);
+  }
 }
 
 // =====================================================
@@ -233,10 +300,14 @@ void updateControl(
 
 void setup()
 {
-  Serial.begin(9600);
-
   pinMode(PUMP_PIN, OUTPUT);
   pumpOff();
+
+  Serial.begin(9600);
+
+  thermocouple1.begin();
+  thermocouple2.begin();
+  delay(500);   // MAX31855 needs time after power-up before first read
 
   Serial.println("Vacuum pump controller starting.");
   Serial.println("Pump held OFF until sensors are validated.");
@@ -272,26 +343,34 @@ void loop()
   );
 
   // Diagnostic output
-  Serial.println("----------------------------");
+  Serial.println(F("----------------------------"));
 
-  Serial.print("Pressure 1: ");
-  Serial.println(p1Valid ? String(p1, 2) : "INVALID");
+  Serial.print(F("Pressure 1 (psig): "));
+  if (p1Valid) Serial.println(p1, 2); else Serial.println(F("INVALID"));
 
-  Serial.print("Pressure 2: ");
-  Serial.println(p2Valid ? String(p2, 2) : "INVALID");
+  Serial.print(F("Pressure 2 (psig): "));
+  if (p2Valid) Serial.println(p2, 2); else Serial.println(F("INVALID"));
 
-  Serial.print("Temperature 1: ");
-  Serial.println(t1Valid ? String(t1, 2) : "INVALID");
+  Serial.print(F("Temperature 1 (C): "));
+  if (t1Valid) Serial.println(t1, 2); else Serial.println(F("INVALID"));
 
-  Serial.print("Temperature 2: ");
-  Serial.println(t2Valid ? String(t2, 2) : "INVALID");
+  Serial.print(F("Temperature 2 (C): "));
+  if (t2Valid) Serial.println(t2, 2); else Serial.println(F("INVALID"));
 
-  Serial.print("Pump: ");
-  Serial.println(pumpOn ? "ON" : "OFF");
+  Serial.print(F("Pump duty: "));
+  Serial.print(dutyPct);
+  Serial.print(F("% (target "));
+  Serial.print(TARGET_DUTY_PCT);
+  Serial.print(F("% = nominal "));
+  Serial.print(TARGET_FLOW_LPM, 1);
+  Serial.println(F(" L/min)"));
 
-  Serial.print("Fault state: ");
-  Serial.println(faultLatched ? "LATCHED" : "CLEAR");
+  Serial.print(F("Mode: "));
+  Serial.println(controlMode);
 
-  Serial.print("Reason: ");
+  Serial.print(F("Fault state: "));
+  Serial.println(faultLatched ? F("LATCHED") : F("CLEAR"));
+
+  Serial.print(F("Reason: "));
   Serial.println(faultReason);
 }

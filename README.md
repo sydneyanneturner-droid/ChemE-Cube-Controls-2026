@@ -3,25 +3,37 @@
 ## Overview
 
 This project controls a 12 V vacuum pump using an Arduino Uno,
-two pressure transmitters, and two Type J thermocouples.
+two pressure transmitters, and two Type K thermocouples.
 
-The controller monitors pressure and temperature and switches
-the pump through an external N-channel MOSFET.
+The controller drives the pump with PWM through an external
+N-channel MOSFET. It runs the pump at the duty cycle calibrated
+for 10 L/min. When any pressure or temperature reading rises
+above its throttle threshold, the pump slows down step by step.
+Once readings fall back below the threshold (minus a hysteresis
+band), it ramps back up to the 10 L/min duty.
 
-The pump is commanded OFF if:
-- Either pressure sensor exceeds the pressure limit.
-- Either temperature sensor exceeds the temperature limit.
+The pump is commanded OFF (hard trip) if:
+- Either pressure sensor exceeds the pressure trip limit.
+- Either temperature sensor exceeds the temperature trip limit.
 - A sensor reading is invalid or outside its configured range.
 
 The controller requires sustained valid readings within limits
-before automatically restarting the pump.
+before automatically restarting the pump. Restarts begin at the
+minimum duty (soft start) and ramp up.
+
+## Sketch Location
+
+Open `VacuumPumpControl/VacuumPumpControl.ino` in the Arduino IDE.
+Install the "Adafruit MAX31855 library" (and its dependency
+Adafruit BusIO) from the Library Manager. Board: Arduino Uno.
 
 ## Hardware
 
 - Arduino Uno
 - 2 pressure transmitters with 4–20 mA outputs
-- 2 Type J thermocouples
-- 2 MAX31855 thermocouple interface modules
+- 2 Type K thermocouples
+- 2 MAX31855K thermocouple interface modules (the standard
+  MAX31855 is Type K only; Type J probes need MAX31855J boards)
 - 2 separate 250-ohm shunt resistors
 - 2 voltage-divider circuits per the wiring design
 - Logic-level N-channel MOSFET suitable for the pump current
@@ -39,7 +51,7 @@ before automatically restarting the pump.
 | MAX31855 data out | D12 |
 | Thermocouple 1 chip select | D10 |
 | Thermocouple 2 chip select | D9 |
-| MOSFET gate control | D7 |
+| MOSFET gate control (PWM) | D6 |
 
 The MAX31855 modules share clock and data-out connections.
 Each module has a separate chip-select connection.
@@ -48,8 +60,15 @@ Each module has a separate chip-select connection.
 
 The default code settings are:
 
-- Pressure limit: 5.0 psig
-- Temperature limit: 50.0 degrees C
+- Target flow: 10 L/min at `TARGET_DUTY_PCT` (default 80%, MUST be
+  calibrated with a flowmeter; there is no flow sensor, so flow
+  control is open-loop)
+- Minimum duty: 35% (`MIN_DUTY_PCT`, calibrate so the pump never
+  stalls)
+- Ramp: down 5% / up 2% per reading
+- Throttle thresholds: 4.0 psig, 45.0 degrees C
+- Hysteresis: 0.5 psi, 2.0 degrees C
+- Hard trip limits (pump OFF): 5.0 psig, 50.0 degrees C
 - Sensor read interval: 500 milliseconds
 - Recovery period: 5 seconds
 - Required consecutive good readings: 10
@@ -67,14 +86,20 @@ the actual sensor supports that range.
 ## How the Controller Works
 
 1. The Arduino reads both pressure sensors and both temperature
-   sensors.
+   sensors every 500 ms.
 2. It checks readings for invalid values and implausible ranges.
-3. If any limit is exceeded or a fault is detected, the pump is
+3. If a trip limit is exceeded or a fault is detected, the pump is
    commanded OFF and the fault is latched.
 4. The pump remains OFF while the fault persists.
-5. After the readings are valid, agree sufficiently, and remain
-   within limits for the recovery period, the controller permits
-   the pump to restart.
+5. After the readings are valid and remain within limits for the
+   recovery period, the pump restarts at minimum duty.
+6. In normal operation the highest pressure and highest
+   temperature are compared with the throttle thresholds:
+   - Above threshold: duty drops 5% per reading, down to the
+     minimum duty.
+   - Below threshold minus hysteresis: duty rises 2% per reading,
+     up to the 10 L/min target duty.
+   - Inside the hysteresis band: duty holds.
 
 Negative gauge pressure is acceptable when the pressure sensor
 is designed and calibrated to measure vacuum.
@@ -100,7 +125,8 @@ The program prints:
 - Pressure sensor 2 reading and status
 - Temperature sensor 1 reading and status
 - Temperature sensor 2 reading and status
-- Pump ON/OFF state
+- Pump duty (%) and target
+- Control mode (soft start, ramping up, throttling, holding, off)
 - Fault latch status
 - Current fault reason
 
@@ -119,6 +145,12 @@ Before relying on the controller:
 6. Test disconnected and faulty sensors without running the pump.
 7. Confirm the pump switches OFF for every simulated fault.
 8. Verify the recovery behavior before normal operation.
+
+To set the 10 L/min duty: run the pump with a flowmeter in the
+line at normal operating conditions, adjust `TARGET_DUTY_PCT`
+until it reads 10 L/min, and re-upload. Find the lowest duty at
+which the pump still starts and turns reliably, and set
+`MIN_DUTY_PCT` a little above it.
 
 The Arduino Uno's ADC reference and resistor tolerances can
 introduce measurement errors. Calibrate each channel.
