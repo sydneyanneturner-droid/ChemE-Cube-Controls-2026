@@ -24,8 +24,8 @@ const int THERMO_DO  = 12;
 const int THERMO_CS_1 = 10;
 const int THERMO_CS_2 = 9;
 
-// MOSFET gate controlling the vacuum pump.
-// Must be a PWM pin. D6 runs at ~980 Hz on the Uno (Timer0).
+// MOSFET gate controlling the vacuum pump (through 220 ohm R_GATE).
+// Must be a PWM pin. The PWM frequency depends on the board.
 const int PUMP_PIN = 6;
 
 Adafruit_MAX31855 thermocouple1(
@@ -36,14 +36,22 @@ Adafruit_MAX31855 thermocouple2(
   THERMO_CLK, THERMO_CS_2, THERMO_DO
 );
 
-// Arduino Uno ADC
+// Arduino Uno R4 Minima ADC (default 10-bit, 5 V reference)
 const float ADC_REFERENCE_V = 5.00;
 
-// Each transmitter uses a 250-ohm shunt resistor
+// Each transmitter uses a 100-ohm shunt resistor
 // and a 10k/20k voltage divider.
-const float SHUNT_RESISTOR_OHMS = 250.0;
+// THE SHUNT VALUE HERE MUST MATCH THE RESISTOR ON THE BOARD.
+// Measure it with the power off (ohms range) if unsure.
+const float SHUNT_RESISTOR_OHMS = 100.0;
 const float R_TOP_OHMS = 10000.0;
 const float R_BOTTOM_OHMS = 20000.0;
+
+// The divider loads the shunt slightly, so use the parallel value
+// when converting shunt voltage to current.
+const float SHUNT_EFFECTIVE_OHMS =
+    (SHUNT_RESISTOR_OHMS * (R_TOP_OHMS + R_BOTTOM_OHMS)) /
+    (SHUNT_RESISTOR_OHMS + R_TOP_OHMS + R_BOTTOM_OHMS);
 
 const float PRESSURE_MIN_PSI = 0.0;
 const float PRESSURE_MAX_PSI = 15.0;
@@ -122,21 +130,38 @@ const char *controlMode = "OFF";
 // PRESSURE READING
 // =====================================================
 
-float readPressure(int pin, bool &valid, float &current_mA)
+// Returns the pressure for the control logic (NAN if the reading is
+// invalid). The measured values are ALWAYS returned through the
+// reference parameters so they can be printed even when invalid:
+//   current_mA = loop current
+//   pinVolts   = voltage on the Arduino pin
+//   rawPsi     = pressure calculated from the loop current
+float readPressure(
+  int pin,
+  bool &valid,
+  float &current_mA,
+  float &pinVolts,
+  float &rawPsi)
 {
   int adcValue = analogRead(pin);
 
-  float adcVoltage =
+  pinVolts =
       (adcValue / 1023.0) * ADC_REFERENCE_V;
 
   // Undo the external voltage divider
   float transmitterVoltage =
-      adcVoltage *
+      pinVolts *
       ((R_TOP_OHMS + R_BOTTOM_OHMS) / R_BOTTOM_OHMS);
 
   // Convert voltage across the shunt to current
   current_mA =
-      (transmitterVoltage / SHUNT_RESISTOR_OHMS) * 1000.0;
+      (transmitterVoltage / SHUNT_EFFECTIVE_OHMS) * 1000.0;
+
+  // Convert 4-20 mA linearly to the configured pressure range
+  rawPsi =
+      PRESSURE_MIN_PSI +
+      ((current_mA - 4.0) / 16.0) *
+      (PRESSURE_MAX_PSI - PRESSURE_MIN_PSI);
 
   // Detect open-circuit, short-circuit, or out-of-range current
   if (!isfinite(current_mA) ||
@@ -147,22 +172,16 @@ float readPressure(int pin, bool &valid, float &current_mA)
     return NAN;
   }
 
-  // Convert 4-20 mA linearly to the configured pressure range
-  float pressure =
-      PRESSURE_MIN_PSI +
-      ((current_mA - 4.0) / 16.0) *
-      (PRESSURE_MAX_PSI - PRESSURE_MIN_PSI);
-
-  if (!isfinite(pressure) ||
-      pressure < PRESSURE_MIN_PSI - 0.5 ||
-      pressure > PRESSURE_MAX_PSI + 0.5)
+  if (!isfinite(rawPsi) ||
+      rawPsi < PRESSURE_MIN_PSI - 0.5 ||
+      rawPsi > PRESSURE_MAX_PSI + 0.5)
   {
     valid = false;
     return NAN;
   }
 
   valid = true;
-  return pressure;
+  return rawPsi;
 }
 
 // =====================================================
@@ -211,15 +230,27 @@ float typeJ_C(float mV)
   return t;
 }
 
+// Returns the temperature for the control logic (NAN if invalid).
+// rawTempC is ALWAYS the calculated Type J temperature (NAN only when
+// the chip itself reports an open/short fault), so it can be printed
+// even when the reading is rejected.
 float readTemperature(
   Adafruit_MAX31855 &sensor,
   bool &valid,
   float &reportedK,
-  float &coldJunction)
+  float &coldJunction,
+  float &rawTempC)
 {
   // readCelsius() returns NAN on open/short faults
   reportedK = sensor.readCelsius();
   coldJunction = sensor.readInternal();
+
+  // Back out the measured thermocouple voltage (mV)
+  float tcVoltage_mV =
+      (reportedK - coldJunction) * MAX31855K_UV_PER_C / 1000.0;
+
+  // Add cold-junction compensation using the Type J curve
+  rawTempC = typeJ_C(tcVoltage_mV + typeJ_mV(coldJunction));
 
   // An unpowered board or a broken CLK/DO/CS wire reads as all zeros,
   // which looks like a valid 0.00 C with no fault bits set. A real board
@@ -230,23 +261,16 @@ float readTemperature(
     return NAN;
   }
 
-  // Back out the measured thermocouple voltage (mV)
-  float tcVoltage_mV =
-      (reportedK - coldJunction) * MAX31855K_UV_PER_C / 1000.0;
-
-  // Add cold-junction compensation using the Type J curve
-  float temperature = typeJ_C(tcVoltage_mV + typeJ_mV(coldJunction));
-
-  if (!isfinite(temperature) ||
-      temperature < MIN_VALID_TEMP_C ||
-      temperature > MAX_VALID_TEMP_C)
+  if (!isfinite(rawTempC) ||
+      rawTempC < MIN_VALID_TEMP_C ||
+      rawTempC > MAX_VALID_TEMP_C)
   {
     valid = false;
     return NAN;
   }
 
   valid = true;
-  return temperature;
+  return rawTempC;
 }
 
 // =====================================================
@@ -370,6 +394,58 @@ void updateControl(
 }
 
 // =====================================================
+// SERIAL PRINTING
+// =====================================================
+
+// Prints a number with 2 decimals, or "--" if it is not a number.
+void printNumber(float value)
+{
+  if (isfinite(value)) Serial.print(value, 2);
+  else Serial.print(F("--"));
+}
+
+// Example: Pressure 1 (psig): 0.62  OK       [loop 4.56 mA, A0 pin 0.303 V]
+void printPressureLine(
+  const __FlashStringHelper *name,
+  const __FlashStringHelper *pinName,
+  bool valid,
+  float rawPsi,
+  float current_mA,
+  float pinVolts)
+{
+  Serial.print(name);
+  Serial.print(F(" (psig): "));
+  printNumber(rawPsi);
+  Serial.print(valid ? F("  OK       ") : F("  INVALID  "));
+  Serial.print(F("[loop "));
+  printNumber(current_mA);
+  Serial.print(F(" mA, "));
+  Serial.print(pinName);
+  Serial.print(F(" pin "));
+  Serial.print(pinVolts, 3);
+  Serial.println(F(" V]"));
+}
+
+// Example: Temperature 1 (C): 23.45  OK       [chip raw 24.00, board 23.50]
+void printTemperatureLine(
+  const __FlashStringHelper *name,
+  bool valid,
+  float rawTempC,
+  float reportedK,
+  float coldJunction)
+{
+  Serial.print(name);
+  Serial.print(F(" (C): "));
+  printNumber(rawTempC);
+  Serial.print(valid ? F("  OK       ") : F("  INVALID  "));
+  Serial.print(F("[chip raw "));
+  printNumber(reportedK);
+  Serial.print(F(", board "));
+  printNumber(coldJunction);
+  Serial.println(F("]"));
+}
+
+// =====================================================
 // SETUP
 // =====================================================
 
@@ -379,6 +455,15 @@ void setup()
   pumpOff();
 
   Serial.begin(9600);
+
+  // The R4 Minima's Serial is USB, so text printed before the Serial
+  // Monitor connects is lost. Wait up to 3 seconds for it to connect.
+  // The pump is already OFF, so this delay is safe.
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 3000)
+  {
+    // wait
+  }
 
   thermocouple1.begin();
   thermocouple2.begin();
@@ -407,52 +492,32 @@ void loop()
   bool t2Valid = false;
 
   // Raw values, printed for wiring diagnosis
-  float mA1, mA2, rawK1, rawK2, cj1, cj2;
+  float mA1, mA2, volts1, volts2, rawPsi1, rawPsi2;
+  float rawK1, rawK2, cj1, cj2, rawT1, rawT2;
 
-  float p1 = readPressure(PRESSURE_PIN_1, p1Valid, mA1);
-  float p2 = readPressure(PRESSURE_PIN_2, p2Valid, mA2);
+  float p1 = readPressure(PRESSURE_PIN_1, p1Valid, mA1, volts1, rawPsi1);
+  float p2 = readPressure(PRESSURE_PIN_2, p2Valid, mA2, volts2, rawPsi2);
 
-  float t1 = readTemperature(thermocouple1, t1Valid, rawK1, cj1);
-  float t2 = readTemperature(thermocouple2, t2Valid, rawK2, cj2);
+  float t1 = readTemperature(thermocouple1, t1Valid, rawK1, cj1, rawT1);
+  float t2 = readTemperature(thermocouple2, t2Valid, rawK2, cj2, rawT2);
 
   updateControl(
     p1, p2, t1, t2,
     p1Valid, p2Valid, t1Valid, t2Valid
   );
 
-  // Diagnostic output
+  // Diagnostic output: every reading is printed every cycle,
+  // whether or not it is valid or near a limit.
   Serial.println(F("----------------------------"));
 #if BENCH_TEST
   Serial.println(F("*** BENCH TEST MODE: pressure limits 0.5/1.5 psig ***"));
 #endif
 
-  Serial.print(F("Pressure 1 (psig): "));
-  if (p1Valid) Serial.print(p1, 2); else Serial.print(F("INVALID"));
-  Serial.print(F("   [loop "));
-  Serial.print(mA1, 2);
-  Serial.println(F(" mA]"));
+  printPressureLine(F("Pressure 1"), F("A0"), p1Valid, rawPsi1, mA1, volts1);
+  printPressureLine(F("Pressure 2"), F("A1"), p2Valid, rawPsi2, mA2, volts2);
 
-  Serial.print(F("Pressure 2 (psig): "));
-  if (p2Valid) Serial.print(p2, 2); else Serial.print(F("INVALID"));
-  Serial.print(F("   [loop "));
-  Serial.print(mA2, 2);
-  Serial.println(F(" mA]"));
-
-  Serial.print(F("Temperature 1 (C): "));
-  if (t1Valid) Serial.print(t1, 2); else Serial.print(F("INVALID"));
-  Serial.print(F("   [chip raw "));
-  Serial.print(rawK1, 2);
-  Serial.print(F(", board "));
-  Serial.print(cj1, 2);
-  Serial.println(F("]"));
-
-  Serial.print(F("Temperature 2 (C): "));
-  if (t2Valid) Serial.print(t2, 2); else Serial.print(F("INVALID"));
-  Serial.print(F("   [chip raw "));
-  Serial.print(rawK2, 2);
-  Serial.print(F(", board "));
-  Serial.print(cj2, 2);
-  Serial.println(F("]"));
+  printTemperatureLine(F("Temperature 1"), t1Valid, rawT1, rawK1, cj1);
+  printTemperatureLine(F("Temperature 2"), t2Valid, rawT2, rawK2, cj2);
 
   Serial.print(F("Pump duty: "));
   Serial.print(dutyPct);
