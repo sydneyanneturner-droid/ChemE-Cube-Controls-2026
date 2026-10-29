@@ -8,7 +8,7 @@
 // 1 = bench test: pressure limits lowered so they can be reached
 //     by blowing into a sensor port at ambient conditions.
 // 0 = normal operation. SET BACK TO 0 BEFORE REAL USE.
-#define BENCH_TEST 0
+#define BENCH_TEST 1
 
 // =====================================================
 // PIN ASSIGNMENTS
