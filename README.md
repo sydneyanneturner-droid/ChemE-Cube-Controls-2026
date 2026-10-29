@@ -34,7 +34,7 @@ Everything runs from a **single 12 V supply**. There is no boost converter: the 
 | `D12` | Thermocouple amps, data out (shared) |
 | `D10` | Thermocouple amp 1, chip select |
 | `D9` | Thermocouple amp 2, chip select |
-| `D7` | MOSFET gate (pump on = HIGH), through a 220 Ω resistor with a 10 kΩ pulldown to ground |
+| `D6` | MOSFET gate (pump on = HIGH), through a 220 Ω resistor with a 10 kΩ pulldown to ground |
 | `VIN` (Arduino pin) | 12 V from the power rail |
 | `5V` (Arduino pin) | Powers both thermocouple amps, connected to the `VCC` pin on each amp |
 
